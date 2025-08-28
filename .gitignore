@@ -1,0 +1,9 @@
+
+# Python gitignore
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+temp_image.png
