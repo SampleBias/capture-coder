@@ -68,6 +68,7 @@ def capture_and_process():
         print("Invalid selection area.")
         return
 
+
     print("Area selected. Capturing image...")
 
     try:
