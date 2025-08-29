@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import threading
 import subprocess
@@ -6,6 +7,8 @@ from queue import Queue
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from contextlib import contextmanager
+import logging
+import random
 
 from dotenv import load_dotenv
 from pynput import keyboard, mouse
@@ -16,6 +19,13 @@ from tkinter import Canvas
 import io
 import Quartz
 
+# Suppress gRPC fork warnings
+os.environ['GRPC_ENABLE_FORK_SUPPORT'] = '0'
+os.environ['GRPC_POLL_STRATEGY'] = 'poll'
+
+# Suppress absl logging warnings
+logging.getLogger('absl').setLevel(logging.ERROR)
+
 # Load environment variables
 load_dotenv()
 API_KEY = os.getenv('GEMINI_API_KEY')
@@ -23,6 +33,21 @@ if not API_KEY:
     raise ValueError("GEMINI_API_KEY not found in .env file")
 
 genai.configure(api_key=API_KEY)
+
+# Prompt for code-only output
+CODE_SOLVER_PROMPT = """You are a code problem solver. Analyze the image which contains a coding problem/exercise.
+
+CRITICAL RULES:
+1. Output ONLY the code solution - no explanations
+2. Any comments or thoughts must be Python comments starting with #
+3. DO NOT include markdown formatting, no ``` blocks
+4. DO NOT write any text before or after the code
+5. The code should be the complete, runnable solution
+6. Include necessary imports at the top
+7. Use clear variable names
+8. Add brief # comments only where logic is complex
+
+Analyze the problem and output ONLY the Python code solution:"""
 
 @dataclass
 class AppState:
@@ -39,6 +64,7 @@ class AppState:
     last_clipboard_hash: Optional[int] = None
     clipboard_monitoring: bool = True
     processing_queue: Queue = None
+    is_typing: bool = False
     
     def __post_init__(self):
         self.processing_queue = Queue()
@@ -108,11 +134,14 @@ class ScreenCapture:
         try:
             output = io.BytesIO()
             image.save(output, 'PNG')
+            
+            # Suppress stderr to avoid gRPC warnings
             subprocess.run(
                 ['osascript', '-e', 
                  'set the clipboard to (read (POSIX file "/dev/stdin") as PNG picture)'],
                 input=output.getvalue(),
                 capture_output=True,
+                stderr=subprocess.DEVNULL,
                 check=False
             )
             return True
@@ -120,25 +149,43 @@ class ScreenCapture:
             return False
 
 class GeminiProcessor:
-    """Handles Gemini API interactions"""
+    """Handles Gemini API interactions for code problem solving"""
     
     def __init__(self):
         self.model = genai.GenerativeModel('gemini-1.5-pro-latest')
     
-    def process_image(self, image: Image.Image, prompt: str = "Describe this image in detail") -> Optional[str]:
-        """Process image with Gemini"""
+    def process_image(self, image: Image.Image) -> Optional[str]:
+        """Process image with Gemini for code solution"""
         try:
-            # Convert RGBA to RGB if necessary to avoid JPEG conversion issues
+            # Convert RGBA to RGB if necessary
             if image.mode == 'RGBA':
-                # Create a white background
                 rgb_image = Image.new('RGB', image.size, (255, 255, 255))
-                rgb_image.paste(image, mask=image.split()[-1])  # Use alpha channel as mask
+                rgb_image.paste(image, mask=image.split()[-1])
                 image = rgb_image
             
-            response = self.model.generate_content([prompt, image])
-            return response.text
+            response = self.model.generate_content([CODE_SOLVER_PROMPT, image])
+            
+            # Clean the response - remove any markdown formatting
+            code = response.text.strip()
+            
+            # Remove markdown code blocks if present
+            if code.startswith('```'):
+                lines = code.split('\n')
+                # Find start and end of code block
+                code_lines = []
+                in_block = False
+                for line in lines:
+                    if line.startswith('```'):
+                        in_block = not in_block
+                        continue
+                    if in_block or (not line.startswith('```') and not in_block and lines[0].startswith('```')):
+                        code_lines.append(line)
+                code = '\n'.join(code_lines)
+            
+            return code
+            
         except Exception as e:
-            print(f"✗ Gemini API error: {e}")
+            print(f"# Error: {e}")
             return None
 
 class UIManager:
@@ -233,6 +280,46 @@ class ClipboardMonitor:
                 pass
             time.sleep(0.5)
 
+class NaturalTyping:
+    """Handles natural typing simulation"""
+    
+    def __init__(self, kb_controller):
+        self.kb_controller = kb_controller
+        self.base_delay = 0.05  # Base delay between characters
+        self.word_pause = 0.15  # Pause between words
+        self.line_pause = 0.3   # Pause at line breaks
+        self.think_pause = 0.5  # Pause for "thinking" at complex parts
+    
+    def type_naturally(self, text: str):
+        """Type text with natural human-like delays"""
+        lines = text.split('\n')
+        
+        for line_idx, line in enumerate(lines):
+            # Add thinking pause for complex lines (imports, function definitions)
+            if any(keyword in line for keyword in ['import', 'def ', 'class ', 'if __name__']):
+                time.sleep(self.think_pause)
+            
+            # Type the line character by character
+            words = line.split(' ')
+            for word_idx, word in enumerate(words):
+                for char in word:
+                    self.kb_controller.type(char)
+                    # Variable delay for more natural feel
+                    delay = self.base_delay + random.uniform(-0.02, 0.03)
+                    delay = max(0.01, delay)  # Minimum delay
+                    time.sleep(delay)
+                
+                # Add space between words (except last word)
+                if word_idx < len(words) - 1:
+                    self.kb_controller.type(' ')
+                    time.sleep(self.word_pause + random.uniform(-0.05, 0.05))
+            
+            # Add newline between lines (except last line)
+            if line_idx < len(lines) - 1:
+                self.kb_controller.press(keyboard.Key.enter)
+                self.kb_controller.release(keyboard.Key.enter)
+                time.sleep(self.line_pause)
+
 class HotkeyHandler:
     """Handles keyboard and mouse events"""
     
@@ -240,6 +327,7 @@ class HotkeyHandler:
         self.state = state
         self.ui = ui
         self.kb_controller = keyboard.Controller()
+        self.natural_typing = NaturalTyping(self.kb_controller)
     
     def on_key_press(self, key):
         """Handle key press events"""
@@ -256,6 +344,10 @@ class HotkeyHandler:
                         self._capture_window()
                     elif key.char == 'v':
                         self._paste_response()
+                    elif key.char == 'x':
+                        # Emergency stop typing
+                        self.state.is_typing = False
+                        print("# Typing stopped")
         except AttributeError:
             pass
     
@@ -301,8 +393,7 @@ class HotkeyHandler:
         )
         mouse_thread.start()
         
-        print("=== CAPTURE MODE ===")
-        print("Click and drag to select area")
+        print("# Selecting problem area...")
     
     def _capture_window(self):
         """Capture current window"""
@@ -312,19 +403,27 @@ class HotkeyHandler:
             self.state.processing_queue.put(('window', image))
     
     def _paste_response(self):
-        """Paste the stored response"""
-        if self.state.response_text:
-            print("=== PASTING ===")
-            # Use chunked typing for better performance
-            text = self.state.response_text
-            chunk_size = 10  # Type 10 chars at a time
-            for i in range(0, len(text), chunk_size):
-                self.kb_controller.type(text[i:i+chunk_size])
-                if i + chunk_size < len(text):
-                    time.sleep(0.01)  # Minimal delay
-            print("✓ Pasted")
+        """Paste the code solution with natural typing"""
+        if self.state.response_text and not self.state.is_typing:
+            print("# Typing solution...")
+            self.state.is_typing = True
+            
+            # Type in separate thread to not block
+            def type_code():
+                try:
+                    self.natural_typing.type_naturally(self.state.response_text)
+                    print("# Solution typed")
+                except Exception as e:
+                    print(f"# Typing error: {e}")
+                finally:
+                    self.state.is_typing = False
+            
+            typing_thread = threading.Thread(target=type_code, daemon=True)
+            typing_thread.start()
+        elif self.state.is_typing:
+            print("# Already typing...")
         else:
-            print("No response available")
+            print("# No solution available")
 
 class ScreenCaptureApp:
     """Main application controller"""
@@ -339,12 +438,13 @@ class ScreenCaptureApp:
     
     def start(self):
         """Start the application"""
-        print("=== SCREEN CAPTURE GEMINI ===")
-        print("Ctrl+Shift+C: Capture area")
-        print("Ctrl+Shift+W: Capture window")
-        print("Ctrl+Shift+V: Paste response")
-        print("Clipboard monitoring: ACTIVE")
-        print("=" * 40)
+        print("# CODE PROBLEM SOLVER")
+        print("# Ctrl+Shift+C: Capture problem area")
+        print("# Ctrl+Shift+W: Capture window")
+        print("# Ctrl+Shift+V: Type solution")
+        print("# Ctrl+Shift+X: Stop typing")
+        print("# Clipboard monitoring: ON")
+        print("#" * 40)
         
         # Start processing thread
         self.processing_thread = threading.Thread(target=self._process_queue, daemon=True)
@@ -378,22 +478,22 @@ class ScreenCaptureApp:
                         )
                 
                 if image:
-                    print(f"Processing {capture_type} capture...")
+                    print(f"# Analyzing {capture_type} capture...")
                     response = self.processor.process_image(image)
                     if response:
                         self.state.response_text = response
-                        print("✓ Ready to paste (Ctrl+Shift+V)")
+                        print("# Solution ready (Ctrl+Shift+V)")
                     else:
-                        print("✗ Processing failed")
+                        print("# Failed to generate solution")
                 
             except Exception as e:
-                print(f"Processing error: {e}")
+                print(f"# Error: {e}")
 
 if __name__ == "__main__":
     try:
         app = ScreenCaptureApp()
         app.start()
     except KeyboardInterrupt:
-        print("\n=== APP TERMINATED ===")
+        print("\n# TERMINATED")
     except Exception as e:
-        print(f"Fatal error: {e}")
+        print(f"# Fatal: {e}")
