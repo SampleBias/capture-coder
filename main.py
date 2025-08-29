@@ -5,10 +5,11 @@ import threading
 import subprocess
 from queue import Queue
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from contextlib import contextmanager
 import logging
 import random
+import re
 
 from dotenv import load_dotenv
 from pynput import keyboard, mouse
@@ -34,30 +35,59 @@ if not API_KEY:
 
 genai.configure(api_key=API_KEY)
 
-# Prompt for code-only output
-CODE_SOLVER_PROMPT = """You are a code problem solver. Analyze the image which contains a coding problem/exercise.
+# Expert coder prompts for iterative refinement
+INITIAL_ANALYSIS_PROMPT = """You are an expert competitive programmer and software engineer. Analyze this coding problem carefully.
 
-CRITICAL RULES:
-1. Output ONLY the code solution - no explanations
-2. Any comments or thoughts must be Python comments starting with #
-3. DO NOT include markdown formatting, no ``` blocks
-4. DO NOT write any text before or after the code
-5. The code should be the complete, runnable solution
-6. Include necessary imports at the top
-7. Use clear variable names
-8. Add brief # comments only where logic is complex
+First, identify:
+1. Problem type (array manipulation, dynamic programming, graph, etc.)
+2. Key constraints and edge cases
+3. Expected time/space complexity
+4. Optimal approach/algorithm
 
-Analyze the problem and output ONLY the Python code solution:"""
+Then provide a solution following these rules:
+- Output ONLY Python code
+- Use the most efficient algorithm
+- Handle ALL edge cases
+- Include brief # comments for complex logic
+- NO markdown formatting, NO explanations outside code
+- Start with necessary imports
+- Use clear, concise variable names"""
+
+REFINEMENT_PROMPT = """Review this solution for the given problem. Check for:
+1. Correctness - does it solve all cases?
+2. Efficiency - is this optimal O(n) complexity?
+3. Edge cases - empty inputs, single elements, maximums?
+4. Code quality - can it be more concise/Pythonic?
+5. Bug fixes - any logical errors?
+
+Output ONLY the improved Python code. NO explanations outside # comments."""
+
+FINAL_OPTIMIZATION_PROMPT = """Final pass - make this solution production-ready:
+1. Optimize any remaining inefficiencies
+2. Ensure clean, Pythonic code style
+3. Remove redundant operations
+4. Verify all test cases would pass
+
+Output ONLY the final optimized Python code."""
+
+USER_FEEDBACK_PROMPT = """The user has provided feedback about the code:
+{feedback}
+
+Incorporate this feedback and fix the code accordingly.
+Output ONLY the corrected Python code."""
 
 @dataclass
 class AppState:
     """Centralized state management"""
     response_text: str = ""
+    problem_image: Optional[Image.Image] = None
+    iteration_history: List[str] = None
     start_pos: Optional[Tuple[int, int]] = None
     end_pos: Optional[Tuple[int, int]] = None
     capturing: bool = False
     ctrl_pressed: bool = False
     shift_pressed: bool = False
+    alt_pressed: bool = False
     overlay: Optional[tk.Toplevel] = None
     canvas: Optional[Canvas] = None
     rect: Optional[int] = None
@@ -65,9 +95,12 @@ class AppState:
     clipboard_monitoring: bool = True
     processing_queue: Queue = None
     is_typing: bool = False
+    feedback_mode: bool = False
+    feedback_text: str = ""
     
     def __post_init__(self):
         self.processing_queue = Queue()
+        self.iteration_history = []
 
 class ScreenCapture:
     """Handles screen capture operations"""
@@ -107,7 +140,6 @@ class ScreenCapture:
         
         x, y, width, height = bounds
         try:
-            # Use direct bbox capture for efficiency
             return ImageGrab.grab(bbox=(x, y, x + width, y + height))
         except Exception:
             return None
@@ -135,7 +167,6 @@ class ScreenCapture:
             output = io.BytesIO()
             image.save(output, 'PNG')
             
-            # Suppress stderr to avoid gRPC warnings
             subprocess.run(
                 ['osascript', '-e', 
                  'set the clipboard to (read (POSIX file "/dev/stdin") as PNG picture)'],
@@ -148,14 +179,47 @@ class ScreenCapture:
         except Exception:
             return False
 
-class GeminiProcessor:
-    """Handles Gemini API interactions for code problem solving"""
+class ExpertCoder:
+    """Expert coding assistant with iterative refinement"""
     
     def __init__(self):
         self.model = genai.GenerativeModel('gemini-1.5-pro-latest')
+        
+    def clean_code(self, text: str) -> str:
+        """Remove markdown formatting and clean code"""
+        code = text.strip()
+        
+        # Remove markdown code blocks
+        if '```' in code:
+            lines = code.split('\n')
+            code_lines = []
+            in_block = False
+            for line in lines:
+                if line.strip().startswith('```'):
+                    in_block = not in_block
+                    continue
+                if in_block or (not line.strip().startswith('```') and not in_block):
+                    if not line.strip().startswith('```'):
+                        code_lines.append(line)
+            code = '\n'.join(code_lines)
+        
+        return code.strip()
     
-    def process_image(self, image: Image.Image) -> Optional[str]:
-        """Process image with Gemini for code solution"""
+    def extract_feedback(self, text: str) -> Optional[str]:
+        """Extract feedback from markdown comments"""
+        feedback_lines = []
+        for line in text.split('\n'):
+            if line.strip().startswith('#'):
+                # Look for feedback indicators
+                if any(word in line.lower() for word in ['fix', 'change', 'update', 'improve', 'wrong', 'error', 'bug']):
+                    feedback_lines.append(line.strip('#').strip())
+        
+        return ' '.join(feedback_lines) if feedback_lines else None
+    
+    def solve_with_iterations(self, image: Image.Image, max_iterations: int = 3) -> Tuple[str, List[str]]:
+        """Solve problem with iterative refinement"""
+        iterations = []
+        
         try:
             # Convert RGBA to RGB if necessary
             if image.mode == 'RGBA':
@@ -163,29 +227,54 @@ class GeminiProcessor:
                 rgb_image.paste(image, mask=image.split()[-1])
                 image = rgb_image
             
-            response = self.model.generate_content([CODE_SOLVER_PROMPT, image])
+            print("# Step 1: Initial analysis and solution...")
             
-            # Clean the response - remove any markdown formatting
-            code = response.text.strip()
+            # Initial solution
+            response = self.model.generate_content([INITIAL_ANALYSIS_PROMPT, image])
+            solution = self.clean_code(response.text)
+            iterations.append(solution)
             
-            # Remove markdown code blocks if present
-            if code.startswith('```'):
-                lines = code.split('\n')
-                # Find start and end of code block
-                code_lines = []
-                in_block = False
-                for line in lines:
-                    if line.startswith('```'):
-                        in_block = not in_block
-                        continue
-                    if in_block or (not line.startswith('```') and not in_block and lines[0].startswith('```')):
-                        code_lines.append(line)
-                code = '\n'.join(code_lines)
+            if max_iterations > 1:
+                print("# Step 2: Reviewing for correctness and efficiency...")
+                
+                # First refinement - correctness and efficiency
+                refinement_prompt = f"{REFINEMENT_PROMPT}\n\nCurrent solution:\n{solution}"
+                response = self.model.generate_content([refinement_prompt, image])
+                solution = self.clean_code(response.text)
+                iterations.append(solution)
             
-            return code
+            if max_iterations > 2:
+                print("# Step 3: Final optimization pass...")
+                
+                # Final optimization
+                optimization_prompt = f"{FINAL_OPTIMIZATION_PROMPT}\n\nCurrent solution:\n{solution}"
+                response = self.model.generate_content([optimization_prompt, image])
+                solution = self.clean_code(response.text)
+                iterations.append(solution)
+            
+            print(f"# Solution refined through {len(iterations)} iterations")
+            return solution, iterations
             
         except Exception as e:
-            print(f"# Error: {e}")
+            print(f"# Error during solving: {e}")
+            return None, []
+    
+    def apply_user_feedback(self, image: Image.Image, current_code: str, feedback: str) -> Optional[str]:
+        """Apply user feedback to improve the solution"""
+        try:
+            print(f"# Applying feedback: {feedback[:50]}...")
+            
+            prompt = USER_FEEDBACK_PROMPT.format(feedback=feedback)
+            prompt += f"\n\nCurrent code:\n{current_code}"
+            
+            response = self.model.generate_content([prompt, image])
+            improved_code = self.clean_code(response.text)
+            
+            print("# Feedback incorporated")
+            return improved_code
+            
+        except Exception as e:
+            print(f"# Error applying feedback: {e}")
             return None
 
 class UIManager:
@@ -194,15 +283,6 @@ class UIManager:
     def __init__(self, state: AppState):
         self.state = state
         self.root = None
-    
-    @contextmanager
-    def overlay_context(self):
-        """Context manager for overlay creation and cleanup"""
-        try:
-            self.create_overlay()
-            yield
-        finally:
-            self.destroy_overlay()
     
     def create_overlay(self):
         """Create selection overlay"""
@@ -253,11 +333,11 @@ class UIManager:
         )
 
 class ClipboardMonitor:
-    """Monitors clipboard for images"""
+    """Monitors clipboard for images and feedback"""
     
-    def __init__(self, state: AppState, processor: GeminiProcessor):
+    def __init__(self, state: AppState, coder: ExpertCoder):
         self.state = state
-        self.processor = processor
+        self.coder = coder
         self.thread = None
     
     def start(self):
@@ -269,13 +349,29 @@ class ClipboardMonitor:
         """Main monitoring loop"""
         while self.state.clipboard_monitoring:
             try:
+                # Check for images
                 image = ImageGrab.grabclipboard()
                 if isinstance(image, Image.Image):
-                    # Use hash for efficient comparison
                     img_hash = hash(image.tobytes())
                     if img_hash != self.state.last_clipboard_hash:
                         self.state.last_clipboard_hash = img_hash
                         self.state.processing_queue.put(('clipboard', image))
+                
+                # Check for text feedback (markdown comments)
+                try:
+                    clipboard_text = subprocess.check_output(
+                        ['pbpaste'], 
+                        stderr=subprocess.DEVNULL
+                    ).decode('utf-8')
+                    
+                    if clipboard_text and clipboard_text.startswith('#'):
+                        feedback = self.coder.extract_feedback(clipboard_text)
+                        if feedback and feedback != self.state.feedback_text:
+                            self.state.feedback_text = feedback
+                            self.state.processing_queue.put(('feedback', feedback))
+                except:
+                    pass
+                    
             except Exception:
                 pass
             time.sleep(0.5)
@@ -285,47 +381,43 @@ class NaturalTyping:
     
     def __init__(self, kb_controller):
         self.kb_controller = kb_controller
-        self.base_delay = 0.05  # Base delay between characters
-        self.word_pause = 0.15  # Pause between words
-        self.line_pause = 0.3   # Pause at line breaks
-        self.think_pause = 0.5  # Pause for "thinking" at complex parts
+        self.base_delay = 0.04
+        self.word_pause = 0.12
+        self.line_pause = 0.25
+        self.think_pause = 0.4
     
-    def type_naturally(self, text: str):
+    def type_naturally(self, text: str, speed_multiplier: float = 1.0):
         """Type text with natural human-like delays"""
         lines = text.split('\n')
         
         for line_idx, line in enumerate(lines):
-            # Add thinking pause for complex lines (imports, function definitions)
-            if any(keyword in line for keyword in ['import', 'def ', 'class ', 'if __name__']):
-                time.sleep(self.think_pause)
+            # Thinking pause for complex lines
+            if any(keyword in line for keyword in ['import', 'def ', 'class ', 'return', 'for ', 'while ']):
+                time.sleep(self.think_pause * speed_multiplier)
             
-            # Type the line character by character
             words = line.split(' ')
             for word_idx, word in enumerate(words):
                 for char in word:
                     self.kb_controller.type(char)
-                    # Variable delay for more natural feel
-                    delay = self.base_delay + random.uniform(-0.02, 0.03)
-                    delay = max(0.01, delay)  # Minimum delay
-                    time.sleep(delay)
+                    delay = (self.base_delay + random.uniform(-0.015, 0.02)) * speed_multiplier
+                    time.sleep(max(0.01, delay))
                 
-                # Add space between words (except last word)
                 if word_idx < len(words) - 1:
                     self.kb_controller.type(' ')
-                    time.sleep(self.word_pause + random.uniform(-0.05, 0.05))
+                    time.sleep((self.word_pause + random.uniform(-0.03, 0.03)) * speed_multiplier)
             
-            # Add newline between lines (except last line)
             if line_idx < len(lines) - 1:
                 self.kb_controller.press(keyboard.Key.enter)
                 self.kb_controller.release(keyboard.Key.enter)
-                time.sleep(self.line_pause)
+                time.sleep(self.line_pause * speed_multiplier)
 
 class HotkeyHandler:
     """Handles keyboard and mouse events"""
     
-    def __init__(self, state: AppState, ui: UIManager):
+    def __init__(self, state: AppState, ui: UIManager, coder: ExpertCoder):
         self.state = state
         self.ui = ui
+        self.coder = coder
         self.kb_controller = keyboard.Controller()
         self.natural_typing = NaturalTyping(self.kb_controller)
     
@@ -336,6 +428,8 @@ class HotkeyHandler:
                 self.state.ctrl_pressed = True
             elif key == keyboard.Key.shift:
                 self.state.shift_pressed = True
+            elif key == keyboard.Key.alt:
+                self.state.alt_pressed = True
             elif self.state.ctrl_pressed and self.state.shift_pressed:
                 if hasattr(key, 'char'):
                     if key.char == 'c':
@@ -344,10 +438,15 @@ class HotkeyHandler:
                         self._capture_window()
                     elif key.char == 'v':
                         self._paste_response()
+                    elif key.char == 'f':
+                        self._paste_fast()
                     elif key.char == 'x':
-                        # Emergency stop typing
                         self.state.is_typing = False
                         print("# Typing stopped")
+                    elif key.char == 'r':
+                        self._refine_solution()
+                    elif key.char == 'h':
+                        self._show_iteration_history()
         except AttributeError:
             pass
     
@@ -357,6 +456,8 @@ class HotkeyHandler:
             self.state.ctrl_pressed = False
         elif key == keyboard.Key.shift:
             self.state.shift_pressed = False
+        elif key == keyboard.Key.alt:
+            self.state.alt_pressed = False
     
     def on_mouse_click(self, x, y, button, pressed):
         """Handle mouse clicks during capture"""
@@ -383,7 +484,6 @@ class HotkeyHandler:
         self.state.capturing = True
         self.ui.create_overlay()
         
-        # Start mouse listener
         mouse_thread = threading.Thread(
             target=lambda: mouse.Listener(
                 on_click=self.on_mouse_click,
@@ -403,57 +503,79 @@ class HotkeyHandler:
             self.state.processing_queue.put(('window', image))
     
     def _paste_response(self):
-        """Paste the code solution with natural typing"""
+        """Paste with natural typing speed"""
         if self.state.response_text and not self.state.is_typing:
-            print("# Typing solution...")
-            self.state.is_typing = True
-            
-            # Type in separate thread to not block
-            def type_code():
-                try:
-                    self.natural_typing.type_naturally(self.state.response_text)
-                    print("# Solution typed")
-                except Exception as e:
-                    print(f"# Typing error: {e}")
-                finally:
-                    self.state.is_typing = False
-            
-            typing_thread = threading.Thread(target=type_code, daemon=True)
-            typing_thread.start()
-        elif self.state.is_typing:
-            print("# Already typing...")
-        else:
-            print("# No solution available")
+            print("# Typing solution (natural speed)...")
+            self._type_code(speed=1.0)
+    
+    def _paste_fast(self):
+        """Paste with fast typing speed"""
+        if self.state.response_text and not self.state.is_typing:
+            print("# Typing solution (fast)...")
+            self._type_code(speed=0.3)
+    
+    def _type_code(self, speed: float = 1.0):
+        """Type code at specified speed"""
+        self.state.is_typing = True
+        
+        def type_worker():
+            try:
+                self.natural_typing.type_naturally(self.state.response_text, speed)
+                print("# Solution typed")
+            except Exception as e:
+                print(f"# Typing error: {e}")
+            finally:
+                self.state.is_typing = False
+        
+        threading.Thread(target=type_worker, daemon=True).start()
+    
+    def _refine_solution(self):
+        """Trigger refinement of current solution"""
+        if self.state.problem_image and self.state.response_text:
+            print("# Refining solution...")
+            self.state.processing_queue.put(('refine', None))
+    
+    def _show_iteration_history(self):
+        """Show iteration history"""
+        if self.state.iteration_history:
+            print(f"# Iteration history: {len(self.state.iteration_history)} versions")
+            for i, code in enumerate(self.state.iteration_history, 1):
+                print(f"# Version {i}: {len(code.split(chr(10)))} lines")
 
-class ScreenCaptureApp:
+class ExpertSolverApp:
     """Main application controller"""
     
     def __init__(self):
         self.state = AppState()
-        self.processor = GeminiProcessor()
+        self.coder = ExpertCoder()
         self.ui = UIManager(self.state)
-        self.hotkeys = HotkeyHandler(self.state, self.ui)
-        self.clipboard = ClipboardMonitor(self.state, self.processor)
+        self.hotkeys = HotkeyHandler(self.state, self.ui, self.coder)
+        self.clipboard = ClipboardMonitor(self.state, self.coder)
         self.processing_thread = None
     
     def start(self):
         """Start the application"""
-        print("# CODE PROBLEM SOLVER")
-        print("# Ctrl+Shift+C: Capture problem area")
-        print("# Ctrl+Shift+W: Capture window")
-        print("# Ctrl+Shift+V: Type solution")
-        print("# Ctrl+Shift+X: Stop typing")
-        print("# Clipboard monitoring: ON")
+        print("# EXPERT CODE SOLVER v2.0")
+        print("#" * 40)
+        print("# CAPTURE:")
+        print("#   Ctrl+Shift+C: Select problem area")
+        print("#   Ctrl+Shift+W: Capture window")
+        print("# OUTPUT:")
+        print("#   Ctrl+Shift+V: Type solution (natural)")
+        print("#   Ctrl+Shift+F: Type solution (fast)")
+        print("#   Ctrl+Shift+X: Stop typing")
+        print("# REFINEMENT:")
+        print("#   Ctrl+Shift+R: Refine solution")
+        print("#   Ctrl+Shift+H: Show history")
+        print("# FEEDBACK:")
+        print("#   Copy '# fix: ...' to clipboard")
         print("#" * 40)
         
-        # Start processing thread
         self.processing_thread = threading.Thread(target=self._process_queue, daemon=True)
         self.processing_thread.start()
         
-        # Start clipboard monitor
         self.clipboard.start()
         
-        # Start keyboard listener (blocking)
         with keyboard.Listener(
             on_press=self.hotkeys.on_key_press,
             on_release=self.hotkeys.on_key_release
@@ -461,37 +583,75 @@ class ScreenCaptureApp:
             listener.join()
     
     def _process_queue(self):
-        """Process queued capture requests"""
+        """Process queued requests"""
         while True:
             try:
-                capture_type, image = self.state.processing_queue.get()
+                action_type, data = self.state.processing_queue.get()
                 
-                if capture_type == 'area':
-                    # Clean up overlay first
+                if action_type == 'area':
                     self.ui.destroy_overlay()
-                    
-                    # Capture the selected area
                     if self.state.start_pos and self.state.end_pos:
                         image = ScreenCapture.capture_area(
                             self.state.start_pos,
                             self.state.end_pos
                         )
+                        if image:
+                            self._process_problem(image)
                 
-                if image:
-                    print(f"# Analyzing {capture_type} capture...")
-                    response = self.processor.process_image(image)
-                    if response:
-                        self.state.response_text = response
-                        print("# Solution ready (Ctrl+Shift+V)")
+                elif action_type in ['window', 'clipboard']:
+                    if action_type == 'clipboard':
+                        image = data
                     else:
-                        print("# Failed to generate solution")
+                        image = data
+                    if image:
+                        self._process_problem(image)
+                
+                elif action_type == 'refine':
+                    if self.state.problem_image and self.state.response_text:
+                        improved = self.coder.apply_user_feedback(
+                            self.state.problem_image,
+                            self.state.response_text,
+                            "Optimize further and ensure all edge cases are handled"
+                        )
+                        if improved:
+                            self.state.response_text = improved
+                            self.state.iteration_history.append(improved)
+                            print("# Solution refined")
+                
+                elif action_type == 'feedback':
+                    feedback = data
+                    if self.state.problem_image and self.state.response_text:
+                        improved = self.coder.apply_user_feedback(
+                            self.state.problem_image,
+                            self.state.response_text,
+                            feedback
+                        )
+                        if improved:
+                            self.state.response_text = improved
+                            self.state.iteration_history.append(improved)
+                            print(f"# Feedback applied")
                 
             except Exception as e:
-                print(f"# Error: {e}")
+                print(f"# Processing error: {e}")
+    
+    def _process_problem(self, image: Image.Image):
+        """Process a problem image"""
+        print("# Analyzing problem with expert solver...")
+        self.state.problem_image = image
+        
+        solution, iterations = self.coder.solve_with_iterations(image, max_iterations=3)
+        
+        if solution:
+            self.state.response_text = solution
+            self.state.iteration_history = iterations
+            print(f"# Expert solution ready (refined {len(iterations)}x)")
+            print("# Press Ctrl+Shift+V to type")
+        else:
+            print("# Failed to generate solution")
 
 if __name__ == "__main__":
     try:
-        app = ScreenCaptureApp()
+        app = ExpertSolverApp()
         app.start()
     except KeyboardInterrupt:
         print("\n# TERMINATED")
